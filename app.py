@@ -25,9 +25,21 @@ def extract_quotes(pdf_bytes: bytes):
     stehenden Satz als die zitierte Aussage. Eine Klammer mit mehreren durch ';'
     getrennten Quellen ergibt mehrere Eintraege mit demselben Aussage-Text."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    full_text = " ".join(page.get_text() for page in doc)
-    full_text = re.sub(r"\s+", " ", full_text)
+
+    full_text = ""
+    page_ranges = []  # (start_offset, end_offset, page_num) im hochgeladenen Dokument
+    for page_num, page in enumerate(doc, start=1):
+        t = re.sub(r"\s+", " ", page.get_text())
+        start = len(full_text)
+        full_text += t + " "
+        page_ranges.append((start, len(full_text), page_num))
     doc.close()
+
+    def doc_page_for_offset(pos):
+        for start, end, page_num in page_ranges:
+            if start <= pos < end:
+                return page_num
+        return page_ranges[-1][2] if page_ranges else None
 
     results = []
     seen = set()
@@ -39,6 +51,8 @@ def extract_quotes(pdf_bytes: bytes):
         if len(claim_text.split()) < 4:
             continue
 
+        doc_page = doc_page_for_offset(block.start())
+
         for entry in CITATION_ENTRY.finditer(block.group(1)):
             author = entry.group(1).strip(" ,")
             year = entry.group(2)
@@ -48,7 +62,13 @@ def extract_quotes(pdf_bytes: bytes):
                 continue
             seen.add(key)
             results.append(
-                {"text": claim_text, "author": author, "year": year, "page_hint": page_hint}
+                {
+                    "text": claim_text,
+                    "author": author,
+                    "year": year,
+                    "page_hint": page_hint,
+                    "doc_page": doc_page,
+                }
             )
     return results
 
@@ -217,9 +237,10 @@ if quote_pdf_file and book_files:
                 rows.append(
                     {
                         "Zitat": q["text"][:150] + ("..." if len(q["text"]) > 150 else ""),
+                        "Seite (dein Dokument)": q["doc_page"],
                         "Autor": q["author"],
                         "Jahr": q["year"],
-                        "Seite": q["page_hint"],
+                        "Seite (Buch)": q["page_hint"],
                         "PDF": result["filename"],
                         "Status": status,
                     }
