@@ -9,14 +9,10 @@ st.set_page_config(page_title="Zitat-Finder", layout="wide")
 
 MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 
-# Zitat in Anfuehrungszeichen, gefolgt optional von einer Klammer mit Autor/Seitenzahl,
-# z.B. "Zitat..." (Autor, S. 42)
-QUOTE_PATTERN = re.compile(
-    r'[„"»]([^„"“”»«]{15,600}?)[”"«]'
-    r'(?:\s*\(([^()]*?)\))?',
-    re.DOTALL,
-)
-PAGE_IN_CITATION = re.compile(r"S\.?\s*(\d+)", re.IGNORECASE)
+# APA-Stil Zitatklammer, z.B. (Hamprecht, 2025, S. 119; Kochhan & Cichecki, 2024, S. 73)
+CITATION_BLOCK = re.compile(r"\(([^()]*?\d{4}[^()]*?S\.?\s*\d+[^()]*?)\)")
+CITATION_ENTRY = re.compile(r"([^,;]+),\s*(\d{4}),\s*S\.?\s*(\d+)")
+SENTENCE_BOUNDARY = re.compile(r"[.!?]\s|\)\s")
 
 
 @st.cache_resource(show_spinner="Lade Sprachmodell (nur beim ersten Mal, danach gecacht)...")
@@ -25,35 +21,35 @@ def load_model():
 
 
 def extract_quotes(pdf_bytes: bytes):
+    """Findet APA-Zitatklammern wie (Autor, Jahr, S. Seite) und nimmt den davor
+    stehenden Satz als die zitierte Aussage. Eine Klammer mit mehreren durch ';'
+    getrennten Quellen ergibt mehrere Eintraege mit demselben Aussage-Text."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    full_text = ""
-    for page in doc:
-        full_text += page.get_text() + "\n"
+    full_text = " ".join(page.get_text() for page in doc)
+    full_text = re.sub(r"\s+", " ", full_text)
     doc.close()
 
     results = []
     seen = set()
-    for m in QUOTE_PATTERN.finditer(full_text):
-        text = re.sub(r"\s+", " ", m.group(1).strip())
-        if len(text.split()) < 3 or text in seen:
+    for block in CITATION_BLOCK.finditer(full_text):
+        preceding = full_text[: block.start()]
+        boundaries = list(SENTENCE_BOUNDARY.finditer(preceding))
+        start_idx = boundaries[-1].end() if boundaries else max(0, len(preceding) - 400)
+        claim_text = preceding[start_idx:].strip()
+        if len(claim_text.split()) < 4:
             continue
-        seen.add(text)
 
-        citation = (m.group(2) or "").strip()
-        author = None
-        page_hint = None
-        if citation:
-            page_match = PAGE_IN_CITATION.search(citation)
-            if page_match:
-                page_hint = int(page_match.group(1))
-                author = citation[: page_match.start()].strip(" ,")
-            else:
-                author = citation.strip(" ,")
-            author = author or None
-
-        # nur Zitate uebernehmen, die vollstaendig mit Autor UND Seitenzahl gekennzeichnet sind
-        if author and page_hint:
-            results.append({"text": text, "author": author, "page_hint": page_hint})
+        for entry in CITATION_ENTRY.finditer(block.group(1)):
+            author = entry.group(1).strip(" ,")
+            year = entry.group(2)
+            page_hint = int(entry.group(3))
+            key = (claim_text, author, year, page_hint)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(
+                {"text": claim_text, "author": author, "year": year, "page_hint": page_hint}
+            )
     return results
 
 
@@ -114,7 +110,7 @@ def find_book_for_quote(model, quote, chunks, embeddings, book_meta):
     scores = util.cos_sim(query_emb, embeddings)[0].numpy()
 
     author = (quote["author"] or "").lower()
-    author_tokens = [t for t in re.split(r"[\s,]+", author) if len(t) > 2]
+    author_tokens = [t for t in re.split(r"[\s,&]+", author) if len(t) > 2 and t != "und"]
     page_hint = quote["page_hint"]
 
     candidate_filenames = [
@@ -170,8 +166,8 @@ def find_book_for_quote(model, quote, chunks, embeddings, book_meta):
 
 st.title("Zitat-Finder")
 st.caption(
-    "Lade ein PDF mit Zitaten hoch und deine Buecher als PDF. Alle vollstaendig "
-    "gekennzeichneten Zitate (Autor + Seite) werden automatisch den Buechern zugeordnet."
+    "Lade ein PDF mit Zitaten hoch und deine Buecher als PDF. Alle Textstellen mit "
+    "APA-Zitatklammer, z.B. (Autor, Jahr, S. Seite), werden automatisch den Buechern zugeordnet."
 )
 
 col1, col2 = st.columns([1, 1])
@@ -200,8 +196,8 @@ if quote_pdf_file and book_files:
 
     if not quotes:
         st.info(
-            "Es wurden keine vollstaendig gekennzeichneten Zitate gefunden. "
-            "Zitate muessen im Format „Zitat...“ (Autor, S. 42) vorliegen."
+            "Es wurden keine Zitatklammern gefunden. Erwartetes Format: "
+            "„...Aussage im Text (Autor, Jahr, S. 42; Autor2, Jahr, S. 7).“"
         )
     elif embeddings is None or len(chunks) == 0:
         st.error("Keine durchsuchbaren Inhalte in den hochgeladenen Buechern gefunden.")
@@ -222,6 +218,7 @@ if quote_pdf_file and book_files:
                     {
                         "Zitat": q["text"][:150] + ("..." if len(q["text"]) > 150 else ""),
                         "Autor": q["author"],
+                        "Jahr": q["year"],
                         "Seite": q["page_hint"],
                         "PDF": result["filename"],
                         "Status": status,
