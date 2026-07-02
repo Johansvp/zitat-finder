@@ -51,7 +51,9 @@ def extract_quotes(pdf_bytes: bytes):
                 author = citation.strip(" ,")
             author = author or None
 
-        results.append({"text": text, "author": author, "page_hint": page_hint})
+        # nur Zitate uebernehmen, die vollstaendig mit Autor UND Seitenzahl gekennzeichnet sind
+        if author and page_hint:
+            results.append({"text": text, "author": author, "page_hint": page_hint})
     return results
 
 
@@ -106,54 +108,63 @@ def build_index(_model, book_files_data):
 
 
 def find_book_for_quote(model, quote, chunks, embeddings, book_meta):
-    """Findet das wahrscheinlichste Buch + die beste Fundstelle fuer ein Zitat."""
+    """Findet das PDF, aus dem ein Zitat stammt. Autor bestimmt das Buch, die im Zitat
+    angegebene Seite wird zur Verifikation genutzt (nicht selbst geschaetzt)."""
     query_emb = model.encode([quote["text"]], convert_to_numpy=True)
     scores = util.cos_sim(query_emb, embeddings)[0].numpy()
 
     author = (quote["author"] or "").lower()
-    # ersten/letzten Namensbestandteil des Autors als Suchbegriff nehmen (robuster als Vollname)
     author_tokens = [t for t in re.split(r"[\s,]+", author) if len(t) > 2]
-
-    combined = scores.copy()
-    if author_tokens:
-        for i, (filename, _page, _text) in enumerate(chunks):
-            haystack = book_meta.get(filename, {}).get("haystack", "")
-            if any(tok in haystack for tok in author_tokens):
-                combined[i] += 0.15
-
-    best_idx = int(np.argmax(combined))
-    best_filename = chunks[best_idx][0]
-    best_score = float(scores[best_idx])
-    author_matched = combined[best_idx] > scores[best_idx]
-
-    # Falls Seitenzahl im Zitat angegeben ist und existiert: bevorzugt diese Seite im gefundenen Buch nutzen
-    used_page_hint = False
-    page_num = chunks[best_idx][1]
-    chunk_text = chunks[best_idx][2]
-
     page_hint = quote["page_hint"]
-    if page_hint and page_hint <= book_meta.get(best_filename, {}).get("num_pages", 0):
-        same_page_chunks = [
-            (i, c) for i, c in enumerate(chunks) if c[0] == best_filename and c[1] == page_hint
+
+    candidate_filenames = [
+        fn
+        for fn, meta in book_meta.items()
+        if author_tokens and any(tok in meta.get("haystack", "") for tok in author_tokens)
+    ]
+    if not candidate_filenames:
+        candidate_filenames = list(book_meta.keys())
+        author_matched = False
+    else:
+        author_matched = True
+
+    # unter den Kandidaten-Buechern: bestbewerteten Chunk exakt auf der angegebenen Seite suchen
+    best = None
+    for fn in candidate_filenames:
+        page_chunks = [
+            (i, c) for i, c in enumerate(chunks) if c[0] == fn and c[1] == page_hint
         ]
-        if same_page_chunks:
-            # besten (aehnlichsten) Chunk auf der angegebenen Seite fuer das Highlighting waehlen
-            i_best, c_best = max(same_page_chunks, key=lambda ic: scores[ic[0]])
-            page_num = page_hint
-            chunk_text = c_best[2]
-            used_page_hint = True
-        else:
-            page_num = page_hint
-            chunk_text = ""
-            used_page_hint = True
+        for i, c in page_chunks:
+            score = float(scores[i])
+            if best is None or score > best[0]:
+                best = (score, fn, c[2])
+
+    if best is not None:
+        score, filename, chunk_text = best
+        return {
+            "filename": filename,
+            "page_num": page_hint,
+            "chunk_text": chunk_text,
+            "score": score,
+            "author_matched": author_matched,
+            "verified": True,
+        }
+
+    # Zitat wurde auf der angegebenen Seite in keinem Kandidaten-Buch gefunden:
+    # bestes Buch ueber den Autor waehlen (falls vorhanden), sonst insgesamt bestes semantisches Ergebnis
+    if candidate_filenames != list(book_meta.keys()):
+        idxs = [i for i, c in enumerate(chunks) if c[0] in candidate_filenames]
+        best_idx = max(idxs, key=lambda i: scores[i])
+    else:
+        best_idx = int(np.argmax(scores))
 
     return {
-        "filename": best_filename,
-        "page_num": page_num,
-        "chunk_text": chunk_text,
-        "score": best_score,
+        "filename": chunks[best_idx][0],
+        "page_num": page_hint,
+        "chunk_text": "",
+        "score": float(scores[best_idx]),
         "author_matched": author_matched,
-        "used_page_hint": used_page_hint,
+        "verified": False,
     }
 
 
@@ -203,7 +214,10 @@ if quote_pdf_file and book_files:
     chunks, embeddings, book_meta = build_index(model, book_files_data)
 
     if not quotes:
-        st.info("Es wurden keine Zitate (Text in Anfuehrungszeichen) im hochgeladenen PDF gefunden.")
+        st.info(
+            "Es wurden keine vollstaendig gekennzeichneten Zitate gefunden. "
+            "Zitate muessen im Format „Zitat...“ (Autor, S. 42) vorliegen."
+        )
     else:
         st.subheader(f"{len(quotes)} Zitate gefunden — klicke auf eines")
 
@@ -230,17 +244,23 @@ if quote_pdf_file and book_files:
             if embeddings is None or len(chunks) == 0:
                 st.error("Keine durchsuchbaren Inhalte in den hochgeladenen Buechern gefunden.")
             else:
-                with st.spinner("Suche passendes Buch..."):
+                with st.spinner("Suche PDF..."):
                     result = find_book_for_quote(model, sel, chunks, embeddings, book_meta)
 
-                confidence_note = " · Autor-Abgleich bestaetigt" if result["author_matched"] else ""
-                page_note = (
-                    " (Seite laut Zitatangabe verwendet)" if result["used_page_hint"] else " (Seite automatisch erkannt)"
-                )
-                st.success(
-                    f"Gefunden in **{result['filename']}**, Seite **{result['page_num']}**{page_note} "
-                    f"— Aehnlichkeit: {result['score']:.0%}{confidence_note}"
-                )
+                st.markdown(f"### PDF: {result['filename']}")
+                st.caption(f"Seite {result['page_num']} (laut Zitatangabe)")
+
+                if result["verified"]:
+                    st.success("Zitat auf dieser Seite in diesem PDF bestaetigt gefunden.")
+                elif result["author_matched"]:
+                    st.warning(
+                        "Autor gefunden, das Zitat konnte auf der angegebenen Seite aber nicht "
+                        "exakt bestaetigt werden (evtl. abweichender Text-Layout)."
+                    )
+                else:
+                    st.warning(
+                        "Kein PDF mit passendem Autor gefunden — bestes inhaltliches Ergebnis wird angezeigt."
+                    )
 
                 img_bytes = render_highlighted_page(
                     book_bytes_by_name[result["filename"]], result["page_num"], result["chunk_text"]
