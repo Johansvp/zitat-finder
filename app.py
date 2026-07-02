@@ -168,23 +168,10 @@ def find_book_for_quote(model, quote, chunks, embeddings, book_meta):
     }
 
 
-def render_highlighted_page(pdf_bytes: bytes, page_num: int, search_text: str):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[page_num - 1]
-    if search_text:
-        rects = page.search_for(search_text[:200])
-        for r in rects:
-            page.add_highlight_annot(r)
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-    img_bytes = pix.tobytes("png")
-    doc.close()
-    return img_bytes
-
-
 st.title("Zitat-Finder")
 st.caption(
-    "Lade ein PDF mit Zitaten hoch und deine Buecher als PDF. Klicke auf ein Zitat, "
-    "um das passende Buch und die Fundstelle zu finden."
+    "Lade ein PDF mit Zitaten hoch und deine Buecher als PDF. Alle vollstaendig "
+    "gekennzeichneten Zitate (Autor + Seite) werden automatisch den Buechern zugeordnet."
 )
 
 col1, col2 = st.columns([1, 1])
@@ -209,8 +196,6 @@ if quote_pdf_file and book_files:
     quotes = extract_quotes(quote_pdf_bytes)
 
     book_files_data = [(f.name, f.read()) for f in book_files]
-    book_bytes_by_name = {name: data for name, data in book_files_data}
-
     chunks, embeddings, book_meta = build_index(model, book_files_data)
 
     if not quotes:
@@ -218,57 +203,31 @@ if quote_pdf_file and book_files:
             "Es wurden keine vollstaendig gekennzeichneten Zitate gefunden. "
             "Zitate muessen im Format „Zitat...“ (Autor, S. 42) vorliegen."
         )
+    elif embeddings is None or len(chunks) == 0:
+        st.error("Keine durchsuchbaren Inhalte in den hochgeladenen Buechern gefunden.")
     else:
-        st.subheader(f"{len(quotes)} Zitate gefunden — klicke auf eines")
+        st.subheader(f"{len(quotes)} Zitate gefunden")
 
-        if "selected_quote_idx" not in st.session_state:
-            st.session_state.selected_quote_idx = None
-
-        for i, q in enumerate(quotes):
-            label = f"„{q['text'][:110]}{'...' if len(q['text']) > 110 else ''}\""
-            hint_parts = []
-            if q["author"]:
-                hint_parts.append(q["author"])
-            if q["page_hint"]:
-                hint_parts.append(f"S. {q['page_hint']}")
-            if hint_parts:
-                label += f"  ({', '.join(hint_parts)})"
-            if st.button(label, key=f"quote_{i}"):
-                st.session_state.selected_quote_idx = i
-
-        if st.session_state.selected_quote_idx is not None:
-            st.divider()
-            sel = quotes[st.session_state.selected_quote_idx]
-            st.markdown(f"**Ausgewaehltes Zitat:** „{sel['text']}\"")
-
-            if embeddings is None or len(chunks) == 0:
-                st.error("Keine durchsuchbaren Inhalte in den hochgeladenen Buechern gefunden.")
-            else:
-                with st.spinner("Suche PDF..."):
-                    result = find_book_for_quote(model, sel, chunks, embeddings, book_meta)
-
-                st.markdown(f"### PDF: {result['filename']}")
-                st.caption(f"Seite {result['page_num']} (laut Zitatangabe)")
-
+        with st.spinner(f"Ordne {len(quotes)} Zitate den Buechern zu..."):
+            rows = []
+            for q in quotes:
+                result = find_book_for_quote(model, q, chunks, embeddings, book_meta)
                 if result["verified"]:
-                    st.success("Zitat auf dieser Seite in diesem PDF bestaetigt gefunden.")
+                    status = "bestaetigt"
                 elif result["author_matched"]:
-                    st.warning(
-                        "Autor gefunden, das Zitat konnte auf der angegebenen Seite aber nicht "
-                        "exakt bestaetigt werden (evtl. abweichender Text-Layout)."
-                    )
+                    status = "Autor gefunden, Seite nicht bestaetigt"
                 else:
-                    st.warning(
-                        "Kein PDF mit passendem Autor gefunden — bestes inhaltliches Ergebnis wird angezeigt."
-                    )
+                    status = "nicht sicher gefunden"
+                rows.append(
+                    {
+                        "Zitat": q["text"][:150] + ("..." if len(q["text"]) > 150 else ""),
+                        "Autor": q["author"],
+                        "Seite": q["page_hint"],
+                        "PDF": result["filename"],
+                        "Status": status,
+                    }
+                )
 
-                img_bytes = render_highlighted_page(
-                    book_bytes_by_name[result["filename"]], result["page_num"], result["chunk_text"]
-                )
-                st.image(
-                    img_bytes,
-                    caption=f"{result['filename']} — Seite {result['page_num']}",
-                    use_container_width=True,
-                )
+        st.dataframe(rows, use_container_width=True, hide_index=True)
 else:
     st.info("Bitte lade oben links dein Zitat-PDF und rechts deine Buecher hoch.")
